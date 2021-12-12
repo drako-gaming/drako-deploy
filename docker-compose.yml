@@ -1,0 +1,131 @@
+version: "3.3"
+services:
+    traefik:
+        image: traefik:v2.2
+        command:
+            - "--api.insecure=true"
+            - "--providers.docker"
+            - "--providers.docker.exposedByDefault=false"
+            - "--entrypoints.websecure.address=:443"
+            - "--entrypoints.web.address=:80"
+            - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+            - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+            - "--certificatesresolvers.le.acme.dnschallenge=true"
+            - "--certificatesresolvers.le.acme.dnschallenge.provider=route53"
+            - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?err}"
+            - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+            - "--certificatesresolvers.le.acme.dnschallenge.resolvers=,8.8.8.8:53,8.8.4.4:53"
+        ports:
+            - "80:80"
+            - "443:443"
+            - "8081:8080"
+        environment:
+            - "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?err}"
+            - "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:?err}"
+            - "AWS_HOSTED_ZONE_ID=${AWS_HOSTED_ZONE_ID:?err}"
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+            - traefik_letsencrypt_data:/letsencrypt
+        restart: always
+
+    postgres:
+        image: postgres:13.3-alpine
+        ports:
+            - "5432:5432"
+        environment:
+            - "DRAKO_API_DB_PASSWORD=${DRAKO_API_DB_PASSWORD:?err}"
+            - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?err}"
+            - "PGPASSWORD=${POSTGRES_PASSWORD:?err}"
+        volumes:
+            - postgresql_data:/var/lib/postgresql/data
+            - ./postgres/init:/docker-entrypoint-initdb.d
+        restart: always
+
+    pgbackup:
+        image: prodrigestivill/postgres-backup-local:13-alpine
+        depends_on:
+            - postgres
+        environment:
+            - "POSTGRES_HOST=postgres"
+            - "POSTGRES_USER=postgres"
+            - "POSTGRES_DB=drakoapi"
+            - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?err}"
+            - "POSTGRES_EXTRA_OPTS=-Z9 --schema=public --blobs"
+            - "SCHEDULE=@daily"
+            - "BACKUP_KEEP_DAYS=30"
+        restart: always
+        volumes:
+            - ./backups/postgres:/backups
+
+    backup:
+        image: futurice/docker-volume-backup:2.3.0
+        volumes:
+          - traefik_letsencrypt_data:/backup/traefik_letsencrypt_data
+          - drako-api_data:/backup/drako-api_data
+          - ./backups/volumes:/archive
+
+    drako-website:
+        image: ghcr.io/drako-gaming/website
+        depends_on:
+          - drako-backend
+        restart: always
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.drako-website.rule=Host(`${DOMAIN}`)"
+            - "traefik.http.routers.drako-website.entrypoints=web,websecure"
+            - "traefik.http.routers.drako-website.tls.certresolver=le"
+            - "traefik.http.middlewares.headers.headers.sslredirect=true"
+            - "traefik.http.middlewares.headers.headers.stsSeconds=3600"
+            - "traefik.http.middlewares.headers.headers.stsPreload=true"
+            - "traefik.http.routers.drako-website.middlewares=headers@docker"
+            - "traefik.http.services.drako-website.loadbalancer.server.port=80"
+
+    drako-backend:
+        image: ghcr.io/drako-gaming/website-backend
+        depends_on:
+            - postgres
+            - redis
+            - drako-backend-database
+        restart: always
+        volumes:
+            - drako-api_data:/dpstore
+        environment:
+            - "http__pathBase=/api"
+            - "database__connectionString=Server=postgres;User Id=drakoapi;Password=${DRAKO_API_DB_PASSWORD:?err};Database=drakoapi"
+            - "quartz__dummy="
+            - "redis__connectionString=redis:6379"
+            - "twitch__ownerUserId=32104770"
+            - "twitch__clientId=${TWITCH_CLIENT_ID:?err}"
+            - "twitch__clientSecret=${TWITCH_CLIENT_SECRET:?err}"
+            - "twitch__webhookCallbackEndpoint=https://${DOMAIN:?err}/api/webhook"
+            - "twitch__webhookSecret=${TWITCH_WEBHOOK_SECRET:?err}"
+            - "rewards__7978ef41-84c8-4cce-bca2-9d1f89cd5c96=100"
+            - "ASPNETCORE_URLS=http://0.0.0.0:80"
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.drako-backend.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)"
+            - "traefik.http.routers.drako-backend.entrypoints=web,websecure"
+            - "traefik.http.routers.drako-backend.tls.certresolver=le"
+            - "traefik.http.middlewares.backend-headers.headers.sslredirect=true"
+            - "traefik.http.middlewares.backend-headers.headers.stsSeconds=3600"
+            - "traefik.http.middlewares.backend-headers.headers.stsPreload=true"
+            - "traefik.http.middlewares.backend-headers.headers.sslProxyHeaders.X-Forwarded-Proto=https"
+            - "traefik.http.middlewares.backend-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+            - "traefik.http.routers.drako-backend.middlewares=backend-headers@docker"
+            - "traefik.http.services.drako-backend.loadbalancer.server.port=80"
+
+    drako-backend-database:
+        image: ghcr.io/drako-gaming/website-backend-database
+        depends_on:
+            - postgres
+        environment:
+            - "database__connectionString=Server=postgres;User Id=postgres;Password=${POSTGRES_PASSWORD};Database=drakoapi"
+
+    redis:
+        image: redis:6.2.4-alpine
+        restart: always
+
+volumes:
+    postgresql_data:
+    traefik_letsencrypt_data:
+    drako-api_data:

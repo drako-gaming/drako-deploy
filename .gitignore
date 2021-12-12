@@ -1,0 +1,6 @@
+﻿backups
+postgres/backups/daily
+postgres/backups/monthly
+postgres/backups/weekly
+
+.env
